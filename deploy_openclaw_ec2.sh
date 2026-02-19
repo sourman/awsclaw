@@ -10,6 +10,20 @@ slugify() {
   echo "$s" | cut -c1-32
 }
 
+check_aws_cli() {
+  if ! command -v aws &>/dev/null; then
+    echo -e "\033[1;31m✗ AWS CLI not found\033[0m"
+    echo -e "  \033[36mbrew install awscli\033[0m"
+    exit 1
+  fi
+
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo -e "\033[1;31m✗ Not logged into AWS\033[0m"
+    echo -e "  Run: \033[36maws login\033[0m"
+    exit 1
+  fi
+}
+
 usage() {
   cat <<USAGE
 Usage:
@@ -33,7 +47,7 @@ NETWORK_MODE=""
 INSTANCE_TYPE="${INSTANCE_TYPE:-}"
 SSH_CIDR_V4="${SSH_CIDR_V4:-0.0.0.0/0}"
 SSH_CIDR_V6="${SSH_CIDR_V6:-::/0}"
-REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region || true)}}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 NON_INTERACTIVE=0
 
 while [[ $# -gt 0 ]]; do
@@ -92,6 +106,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Check AWS CLI installation and credentials BEFORE any user prompts
+check_aws_cli
+
+# If region not set via env var, try to get it from AWS config now that we know aws is working
+if [[ -z "$REGION" || "$REGION" == "None" ]]; then
+  REGION="$(aws configure get region 2>/dev/null || true)"
+fi
+
 if [[ -z "$BOT_NAME_INPUT" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     echo "--bot-name is required with --yes" >&2
@@ -139,17 +161,48 @@ if [[ -z "$INSTANCE_TYPE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     INSTANCE_TYPE="t3.small"
   else
-    cat <<CHOICES
-Select instance tier:
-  1) t3.small   (2 vCPU, 2 GiB, lowest cost)
-  2) t3.medium  (2 vCPU, 4 GiB, safer headroom)
-  3) t3.large   (2 vCPU, 8 GiB, more memory)
+    cat <<'CHOICES'
+Select instance tier (t3 - burstable, general purpose):
+  1) t3.nano    (2 vCPU, 0.5 GiB,   ~$4/month)
+  2) t3.micro   (2 vCPU, 1 GiB,     ~$8/month)
+  3) t3.small   (2 vCPU, 2 GiB,     ~$15/month) [default]
+  4) t3.medium  (2 vCPU, 4 GiB,     ~$30/month)
+  5) t3.large   (2 vCPU, 8 GiB,     ~$60/month)
+  6) t3.xlarge  (4 vCPU, 16 GiB,    ~$120/month)
+
+Select instance tier (m5 - consistent, general purpose):
+  7) m5.large   (2 vCPU, 8 GiB,     ~$70/month)
+  8) m5.xlarge  (4 vCPU, 16 GiB,    ~$140/month)
+  9) m5.2xlarge (8 vCPU, 32 GiB,    ~$280/month)
+
+Select instance tier (c5 - compute optimized):
+ 10) c5.large   (2 vCPU, 4 GiB,     ~$65/month)
+ 11) c5.xlarge  (4 vCPU, 8 GiB,     ~$130/month)
+ 12) c5.2xlarge (8 vCPU, 16 GiB,    ~$260/month)
+
+  0) custom     (enter any instance type)
 CHOICES
-    read -r -p "Enter choice [1/2/3] (default 1): " SIZE_CHOICE
-    case "${SIZE_CHOICE:-1}" in
-      1) INSTANCE_TYPE="t3.small" ;;
-      2) INSTANCE_TYPE="t3.medium" ;;
-      3) INSTANCE_TYPE="t3.large" ;;
+    read -r -p "Enter choice [0-12] (default 3): " SIZE_CHOICE
+    case "${SIZE_CHOICE:-3}" in
+      1) INSTANCE_TYPE="t3.nano" ;;
+      2) INSTANCE_TYPE="t3.micro" ;;
+      3) INSTANCE_TYPE="t3.small" ;;
+      4) INSTANCE_TYPE="t3.medium" ;;
+      5) INSTANCE_TYPE="t3.large" ;;
+      6) INSTANCE_TYPE="t3.xlarge" ;;
+      7) INSTANCE_TYPE="m5.large" ;;
+      8) INSTANCE_TYPE="m5.xlarge" ;;
+      9) INSTANCE_TYPE="m5.2xlarge" ;;
+      10) INSTANCE_TYPE="c5.large" ;;
+      11) INSTANCE_TYPE="c5.xlarge" ;;
+      12) INSTANCE_TYPE="c5.2xlarge" ;;
+      0)
+        read -r -p "Enter instance type (e.g. t3.2xlarge, c5.4xlarge): " INSTANCE_TYPE
+        if [[ -z "$INSTANCE_TYPE" ]]; then
+          echo "Instance type cannot be empty." >&2
+          exit 1
+        fi
+        ;;
       *)
         echo "Invalid instance choice." >&2
         exit 1
@@ -157,6 +210,7 @@ CHOICES
     esac
   fi
 fi
+echo "Using instance type: ${INSTANCE_TYPE}"
 
 if [[ -z "$REGION" || "$REGION" == "None" ]]; then
   echo "AWS region is not configured. Set AWS_REGION or run: aws configure" >&2

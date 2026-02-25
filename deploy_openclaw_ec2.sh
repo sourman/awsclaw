@@ -28,7 +28,7 @@ usage() {
   cat <<USAGE
 Usage:
   ./deploy_openclaw_ec2.sh [bot-name]
-  ./deploy_openclaw_ec2.sh --bot-name NAME [--network-mode ipv4|dualstack|ipv6-only] [--instance-type TYPE] [--ssh-cidr-v4 CIDR] [--ssh-cidr-v6 CIDR] [--region REGION] [--yes]
+  ./deploy_openclaw_ec2.sh --bot-name NAME [--network-mode ipv4|dualstack|ipv6-only] [--instance-type TYPE] [--ssh-cidr-v4 CIDR] [--ssh-cidr-v6 CIDR] [--region REGION] [--elastic-ip] [--yes]
 
 Options:
   -b, --bot-name NAME        Bot name (EC2 Name tag)
@@ -37,6 +37,7 @@ Options:
       --ssh-cidr-v4 CIDR     SSH IPv4 CIDR (default: 0.0.0.0/0)
       --ssh-cidr-v6 CIDR     SSH IPv6 CIDR (default: ::/0)
   -r, --region REGION        AWS region (default: AWS config)
+  -e, --elastic-ip           Allocate and attach a static Elastic IP (free while attached to running instance)
   -y, --yes                  Non-interactive mode (requires bot name + network mode; defaults type to t3.small)
   -h, --help                 Show this help
 USAGE
@@ -48,6 +49,7 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-}"
 SSH_CIDR_V4="${SSH_CIDR_V4:-0.0.0.0/0}"
 SSH_CIDR_V6="${SSH_CIDR_V6:-::/0}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+ELASTIC_IP=0
 NON_INTERACTIVE=0
 
 while [[ $# -gt 0 ]]; do
@@ -75,6 +77,10 @@ while [[ $# -gt 0 ]]; do
     -r|--region)
       REGION="$2"
       shift 2
+      ;;
+    -e|--elastic-ip)
+      ELASTIC_IP=1
+      shift
       ;;
     -y|--yes)
       NON_INTERACTIVE=1
@@ -316,7 +322,7 @@ PY
   aws ec2 create-route --region "$REGION" --route-table-id "$ROUTE_TABLE_ID" --destination-ipv6-cidr-block ::/0 --gateway-id "$IGW_ID" >/dev/null 2>&1 || true
 fi
 
-SG_NAME="openclaw-${BOT_SLUG}-sg"
+SG_NAME="${BOT_SLUG}-sg"
 SG_ID="$(aws ec2 describe-security-groups --region "$REGION" --filters Name=vpc-id,Values="$VPC_ID" Name=group-name,Values="$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
 if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
   SG_ID="$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME" --description "OpenClaw SSH access for ${BOT_NAME_INPUT}" --vpc-id "$VPC_ID" --query GroupId --output text)"
@@ -336,6 +342,23 @@ if [[ "$NETWORK_MODE" == "dualstack" || "$NETWORK_MODE" == "ipv6-only" ]]; then
     --region "$REGION" \
     --group-id "$SG_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":22,\"ToPort\":22,\"Ipv6Ranges\":[{\"CidrIpv6\":\"${SSH_CIDR_V6}\",\"Description\":\"SSH IPv6\"}]}]" \
+    >/dev/null 2>&1 || true
+fi
+
+# HTTPS (port 443) - open to the world
+if [[ "$NETWORK_MODE" == "ipv4" || "$NETWORK_MODE" == "dualstack" ]]; then
+  aws ec2 authorize-security-group-ingress \
+    --region "$REGION" \
+    --group-id "$SG_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"IpRanges\":[{\"CidrIp\":\"0.0.0.0/0\",\"Description\":\"HTTPS IPv4\"}]}]" \
+    >/dev/null 2>&1 || true
+fi
+
+if [[ "$NETWORK_MODE" == "dualstack" || "$NETWORK_MODE" == "ipv6-only" ]]; then
+  aws ec2 authorize-security-group-ingress \
+    --region "$REGION" \
+    --group-id "$SG_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"Ipv6Ranges\":[{\"CidrIpv6\":\"::/0\",\"Description\":\"HTTPS IPv6\"}]}]" \
     >/dev/null 2>&1 || true
 fi
 
@@ -376,7 +399,7 @@ if [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]]; then
   exit 1
 fi
 
-KEY_NAME="openclaw-${BOT_SLUG}-${TIMESTAMP}"
+KEY_NAME="${BOT_SLUG}-${TIMESTAMP}"
 KEY_PATH="$HOME/.ssh/${KEY_NAME}.pem"
 mkdir -p "$HOME/.ssh"
 
@@ -432,6 +455,16 @@ INSTANCE_ID="$(aws ec2 run-instances "${RUN_ARGS[@]}")"
 
 aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 aws ec2 wait instance-status-ok --region "$REGION" --instance-ids "$INSTANCE_ID"
+
+# Handle Elastic IP allocation if requested
+if [[ "$ELASTIC_IP" -eq 1 ]]; then
+  echo "Allocating Elastic IP for persistent public IP..."
+  EIP_ALLOC="$(aws ec2 allocate-address --domain vpc --region "$REGION" --query AllocationId --output text)"
+  echo "Attaching Elastic IP ${EIP_ALLOC} to instance..."
+  aws ec2 associate-address --region "$REGION" --instance-id "$INSTANCE_ID" --allocation-id "$EIP_ALLOC" >/dev/null
+  echo "Elastic IP attached. This IP will persist across instance stop/start cycles."
+  aws ec2 create-tags --region "$REGION" --resources "$EIP_ALLOC" --tags Key=Name,Value="${BOT_NAME_INPUT}-eip" Key=InstanceId,Value="$INSTANCE_ID" >/dev/null
+fi
 
 PUBLIC_IP="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
 PUBLIC_DNS="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)"
